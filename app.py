@@ -9,7 +9,12 @@ CORS(app)  # Enable CORS for frontend integration
 
 # Simple in-memory storage (in production, use a proper database)
 notes = []
-notes_file = 'notes.json'
+# Use persistent disk path for Render, fallback to local for development
+data_dir = os.environ.get('RENDER_EXTERNAL_HOSTNAME') and '/opt/render/project/data' or '.'
+notes_file = os.path.join(data_dir, 'notes.json')
+
+# Ensure data directory exists
+os.makedirs(os.path.dirname(notes_file), exist_ok=True)
 
 # Load notes from file on startup
 def load_notes():
@@ -37,6 +42,7 @@ def home():
     <html>
     <head>
         <title>Note Taking App</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
             * {
                 box-sizing: border-box;
@@ -264,20 +270,24 @@ def home():
                 }
             }
         </style>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
     </head>
     <body>
-        <h1>Greg's Musings</h1>
-        
-        <div>
-            <h2>Add New Note</h2>
-            <input type="text" id="noteTitle" placeholder="Note title">
-            <textarea id="noteContent" rows="4" placeholder="Note content"></textarea>
-            <button onclick="addNote()">Add Note</button>
-        </div>
-        
-        <div id="notesList">
-            <h2>Your Notes</h2>
+        <div class="container">
+            <h1>📝 Greg's Musings</h1>
+            
+            <div class="add-note-section">
+                <h2>✏️ Add New Note</h2>
+                <input type="text" id="noteTitle" placeholder="Enter note title...">
+                <textarea id="noteContent" rows="4" placeholder="Write your note content here..."></textarea>
+                <button onclick="addNote()">Add Note</button>
+            </div>
+            
+            <div id="notesList">
+                <h2>📚 Your Notes</h2>
+                <div class="empty-state" id="emptyState">
+                    No notes yet. Create your first note above! 
+                </div>
+            </div>
         </div>
 
         <script>
@@ -291,32 +301,54 @@ def home():
                     .then(response => response.json())
                     .then(notes => {
                         const notesList = document.getElementById('notesList');
-                        notesList.innerHTML = '<h2>Your Notes</h2>';
+                        const emptyState = document.getElementById('emptyState');
+                        
+                        if (notes.length === 0) {
+                            notesList.innerHTML = '<h2>📚 Your Notes</h2><div class="empty-state">No notes yet. Create your first note above!</div>';
+                            return;
+                        }
+                        
+                        notesList.innerHTML = '<h2>📚 Your Notes</h2>';
                         
                         notes.forEach(note => {
                             const noteDiv = document.createElement('div');
                             noteDiv.className = 'note';
                             noteDiv.innerHTML = `
-                                <h3>${note.title}</h3>
-                                <p>${note.content}</p>
+                                <h3>${escapeHtml(note.title)}</h3>
+                                <p>${escapeHtml(note.content)}</p>
                                 <small>Created: ${new Date(note.created_at).toLocaleString()}</small>
-                                <br><br>
-                                <button class="delete-btn" onclick="deleteNote(${note.id})">Delete</button>
+                                <div class="note-actions">
+                                    <button class="delete-btn" onclick="deleteNote(${note.id})">🗑️ Delete</button>
+                                </div>
                             `;
                             notesList.appendChild(noteDiv);
                         });
                     })
-                    .catch(error => console.error('Error loading notes:', error));
+                    .catch(error => {
+                        console.error('Error loading notes:', error);
+                        alert('Error loading notes. Please try again.');
+                    });
+            }
+
+            function escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
             }
 
             function addNote() {
-                const title = document.getElementById('noteTitle').value;
-                const content = document.getElementById('noteContent').value;
+                const title = document.getElementById('noteTitle').value.trim();
+                const content = document.getElementById('noteContent').value.trim();
                 
                 if (!title || !content) {
                     alert('Please fill in both title and content');
                     return;
                 }
+
+                // Disable button during request
+                const addButton = event.target;
+                addButton.disabled = true;
+                addButton.textContent = 'Adding...';
 
                 fetch('/api/notes', {
                     method: 'POST',
@@ -334,9 +366,18 @@ def home():
                         document.getElementById('noteTitle').value = '';
                         document.getElementById('noteContent').value = '';
                         loadNotes();
+                    } else {
+                        alert('Error adding note: ' + (data.error || 'Unknown error'));
                     }
                 })
-                .catch(error => console.error('Error adding note:', error));
+                .catch(error => {
+                    console.error('Error adding note:', error);
+                    alert('Error adding note. Please try again.');
+                })
+                .finally(() => {
+                    addButton.disabled = false;
+                    addButton.textContent = 'Add Note';
+                });
             }
 
             function deleteNote(noteId) {
