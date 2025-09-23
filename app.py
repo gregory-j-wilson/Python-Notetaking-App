@@ -1,38 +1,63 @@
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
-import json
 import os
+import psycopg2
+import psycopg2.extras
 from datetime import datetime
+from urllib.parse import urlparse
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend integration
+CORS(app)
 
-# Simple in-memory storage (in production, use a proper database)
-notes = []
-# Use persistent disk path for Render, fallback to local for development
-data_dir = os.environ.get('RENDER_EXTERNAL_HOSTNAME') and '/opt/render/project/data' or '.'
-notes_file = os.path.join(data_dir, 'notes.json')
+# Database configuration
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
-# Ensure data directory exists
-os.makedirs(os.path.dirname(notes_file), exist_ok=True)
+def get_db_connection():
+    """Get database connection"""
+    if DATABASE_URL:
+        # Production: Use Render's PostgreSQL
+        conn = psycopg2.connect(DATABASE_URL)
+    else:
+        # Development: Use SQLite fallback
+        import sqlite3
+        conn = sqlite3.connect('notes.db')
+        conn.row_factory = sqlite3.Row
+    return conn
 
-# Load notes from file on startup
-def load_notes():
-    global notes
-    if os.path.exists(notes_file):
-        try:
-            with open(notes_file, 'r') as f:
-                notes = json.load(f)
-        except json.JSONDecodeError:
-            notes = []
+def init_db():
+    """Initialize the database"""
+    conn = get_db_connection()
+    
+    if DATABASE_URL:
+        # PostgreSQL setup
+        with conn.cursor() as cursor:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS notes (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL
+                )
+            ''')
+        conn.commit()
+    else:
+        # SQLite setup for development
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        ''')
+        conn.commit()
+    
+    conn.close()
 
-# Save notes to file
-def save_notes():
-    with open(notes_file, 'w') as f:
-        json.dump(notes, f, indent=2)
-
-# Initialize notes
-load_notes()
+# Initialize database
+init_db()
 
 @app.route('/')
 def home():
@@ -403,6 +428,19 @@ def home():
 @app.route('/api/notes', methods=['GET'])
 def get_notes():
     """Get all notes"""
+    conn = get_db_connection()
+    
+    if DATABASE_URL:
+        # PostgreSQL
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            cursor.execute('SELECT * FROM notes ORDER BY created_at DESC')
+            notes = cursor.fetchall()
+    else:
+        # SQLite
+        notes = conn.execute('SELECT * FROM notes ORDER BY created_at DESC').fetchall()
+        notes = [dict(note) for note in notes]
+    
+    conn.close()
     return jsonify(notes)
 
 @app.route('/api/notes', methods=['POST'])
@@ -413,84 +451,179 @@ def create_note():
     if not data or 'title' not in data or 'content' not in data:
         return jsonify({'error': 'Title and content are required'}), 400
     
-    # Generate simple ID
-    note_id = len(notes) + 1 if notes else 1
-    while any(note['id'] == note_id for note in notes):
-        note_id += 1
+    now = datetime.now()
+    conn = get_db_connection()
     
-    new_note = {
-        'id': note_id,
-        'title': data['title'],
-        'content': data['content'],
-        'created_at': datetime.now().isoformat(),
-        'updated_at': datetime.now().isoformat()
-    }
-    
-    notes.append(new_note)
-    save_notes()
-    
-    return jsonify({'success': True, 'note': new_note}), 201
+    try:
+        if DATABASE_URL:
+            # PostgreSQL
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                cursor.execute(
+                    'INSERT INTO notes (title, content, created_at, updated_at) VALUES (%s, %s, %s, %s) RETURNING *',
+                    (data['title'], data['content'], now, now)
+                )
+                note = cursor.fetchone()
+                conn.commit()
+        else:
+            # SQLite
+            cursor = conn.execute(
+                'INSERT INTO notes (title, content, created_at, updated_at) VALUES (?, ?, ?, ?)',
+                (data['title'], data['content'], now.isoformat(), now.isoformat())
+            )
+            note_id = cursor.lastrowid
+            conn.commit()
+            note = conn.execute('SELECT * FROM notes WHERE id = ?', (note_id,)).fetchone()
+            note = dict(note)
+        
+        conn.close()
+        return jsonify({'success': True, 'note': dict(note)}), 201
+        
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/notes/<int:note_id>', methods=['GET'])
 def get_note(note_id):
     """Get a specific note by ID"""
-    note = next((note for note in notes if note['id'] == note_id), None)
+    conn = get_db_connection()
+    
+    if DATABASE_URL:
+        # PostgreSQL
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            cursor.execute('SELECT * FROM notes WHERE id = %s', (note_id,))
+            note = cursor.fetchone()
+    else:
+        # SQLite
+        note = conn.execute('SELECT * FROM notes WHERE id = ?', (note_id,)).fetchone()
+        if note:
+            note = dict(note)
+    
+    conn.close()
     
     if not note:
         return jsonify({'error': 'Note not found'}), 404
     
-    return jsonify(note)
+    return jsonify(dict(note))
 
 @app.route('/api/notes/<int:note_id>', methods=['PUT'])
 def update_note(note_id):
     """Update a specific note"""
-    note = next((note for note in notes if note['id'] == note_id), None)
-    
-    if not note:
-        return jsonify({'error': 'Note not found'}), 404
-    
+    conn = get_db_connection()
     data = request.get_json()
+    now = datetime.now()
     
-    if 'title' in data:
-        note['title'] = data['title']
-    if 'content' in data:
-        note['content'] = data['content']
-    
-    note['updated_at'] = datetime.now().isoformat()
-    save_notes()
-    
-    return jsonify({'success': True, 'note': note})
+    try:
+        if DATABASE_URL:
+            # PostgreSQL
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                # Check if note exists
+                cursor.execute('SELECT * FROM notes WHERE id = %s', (note_id,))
+                existing_note = cursor.fetchone()
+                
+                if not existing_note:
+                    conn.close()
+                    return jsonify({'error': 'Note not found'}), 404
+                
+                title = data.get('title', existing_note['title'])
+                content = data.get('content', existing_note['content'])
+                
+                cursor.execute(
+                    'UPDATE notes SET title = %s, content = %s, updated_at = %s WHERE id = %s RETURNING *',
+                    (title, content, now, note_id)
+                )
+                note = cursor.fetchone()
+                conn.commit()
+        else:
+            # SQLite
+            existing_note = conn.execute('SELECT * FROM notes WHERE id = ?', (note_id,)).fetchone()
+            
+            if not existing_note:
+                conn.close()
+                return jsonify({'error': 'Note not found'}), 404
+            
+            title = data.get('title', existing_note['title'])
+            content = data.get('content', existing_note['content'])
+            
+            conn.execute(
+                'UPDATE notes SET title = ?, content = ?, updated_at = ? WHERE id = ?',
+                (title, content, now.isoformat(), note_id)
+            )
+            conn.commit()
+            note = conn.execute('SELECT * FROM notes WHERE id = ?', (note_id,)).fetchone()
+            note = dict(note)
+        
+        conn.close()
+        return jsonify({'success': True, 'note': dict(note)})
+        
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/notes/<int:note_id>', methods=['DELETE'])
 def delete_note(note_id):
     """Delete a specific note"""
-    global notes
-    original_length = len(notes)
-    notes = [note for note in notes if note['id'] != note_id]
+    conn = get_db_connection()
     
-    if len(notes) == original_length:
-        return jsonify({'error': 'Note not found'}), 404
-    
-    save_notes()
-    return jsonify({'success': True, 'message': 'Note deleted'})
+    try:
+        if DATABASE_URL:
+            # PostgreSQL
+            with conn.cursor() as cursor:
+                cursor.execute('DELETE FROM notes WHERE id = %s', (note_id,))
+                if cursor.rowcount == 0:
+                    conn.close()
+                    return jsonify({'error': 'Note not found'}), 404
+                conn.commit()
+        else:
+            # SQLite
+            cursor = conn.execute('DELETE FROM notes WHERE id = ?', (note_id,))
+            if cursor.rowcount == 0:
+                conn.close()
+                return jsonify({'error': 'Note not found'}), 404
+            conn.commit()
+        
+        conn.close()
+        return jsonify({'success': True, 'message': 'Note deleted'})
+        
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/notes/search', methods=['GET'])
 def search_notes():
     """Search notes by title or content"""
-    query = request.args.get('q', '').lower()
+    query = request.args.get('q', '').strip()
     
     if not query:
         return jsonify([])
     
-    filtered_notes = [
-        note for note in notes 
-        if query in note['title'].lower() or query in note['content'].lower()
-    ]
+    conn = get_db_connection()
     
-    return jsonify(filtered_notes)
+    if DATABASE_URL:
+        # PostgreSQL (case-insensitive search)
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+            cursor.execute(
+                'SELECT * FROM notes WHERE title ILIKE %s OR content ILIKE %s ORDER BY created_at DESC',
+                (f'%{query}%', f'%{query}%')
+            )
+            notes = cursor.fetchall()
+    else:
+        # SQLite
+        notes = conn.execute(
+            'SELECT * FROM notes WHERE title LIKE ? OR content LIKE ? ORDER BY created_at DESC',
+            (f'%{query}%', f'%{query}%')
+        ).fetchall()
+        notes = [dict(note) for note in notes]
+    
+    conn.close()
+    return jsonify(notes)
 
 if __name__ == '__main__':
     print("Starting Note-Taking Backend Server...")
+    if DATABASE_URL:
+        print("✅ Using PostgreSQL database")
+    else:
+        print("⚠️  Using SQLite fallback (development mode)")
+    
     print("API endpoints:")
     print("  GET    /api/notes          - Get all notes")
     print("  POST   /api/notes          - Create new note")
