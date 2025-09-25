@@ -316,6 +316,23 @@ def home():
         </div>
 
         <script>
+        function checkPassword() {
+            var password = prompt("Please enter the password.  Talk to Greg about it if you don't know password - 316-771-9721"); 
+            if (password === "yhwhroi2335") {
+                // Password is correct, continue loading the page
+                return true;
+            } else {
+                alert("Incorrect password!");
+                return false;
+            }
+        }
+    
+        if (!checkPassword()) {
+            window.location.href = "https://www.google.com"; // Redirect to Google or another page
+        }
+    </script>
+
+        <script>
             // Load notes when page loads
             window.onload = function() {
                 loadNotes();
